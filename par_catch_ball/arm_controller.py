@@ -3,145 +3,129 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from geometry_msgs.msg import Pose
+from moveit_msgs.srv import GetCartesianPath
+from moveit_msgs.action import ExecuteTrajectory
+from moveit_msgs.msg import DisplayTrajectory, RobotState
+import json
+import math
+from builtin_interfaces.msg import Duration
 
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import (
-    MotionPlanRequest,
-    Constraints,
-    PositionConstraint,
-    BoundingVolume,
-    MoveItErrorCodes,
-)
-from shape_msgs.msg import SolidPrimitive
-from geometry_msgs.msg import Pose, Point, Quaternion
 
-class FastInterceptMover(Node):
-    def __init__(self, x: float, y: float, z: float):
-        super().__init__('fast_intercept_mover')
-        self._client = ActionClient(self, MoveGroup, '/move_action')
-        self._point = (x, y, z)
+class ExecuteCartesianPath(Node):
+    def __init__(self):
+        super().__init__('execute_cartesian_path_node')
 
-        # Will hold our original MotionPlanRequest so we can reuse it for execution
-        self._request = None
-        # Timer to kick off send_goal once; we'll cancel it immediately in _send_goal
-        self._timer = self.create_timer(1.0, self._send_goal)
-        self._sent = False
+        self.cartesian_client = self.create_client(GetCartesianPath, '/compute_cartesian_path')
+        self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
+        self.traj_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 10)
 
-    def _send_goal(self):
-        # Ensure we only send once
-        if self._sent:
-            return
-        self._sent = True
-        self._timer.cancel()
+        self.get_logger().info("Waiting for MoveIt services...")
+        while not self.cartesian_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for /compute_cartesian_path...')
 
-        # Wait for MoveIt action server
-        if not self._client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("❌ MoveGroup action server not available.")
-            rclpy.shutdown()
+        while not self.execute_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info('Waiting for /execute_trajectory...')
+
+        self.send_cartesian_path_request()
+
+    def send_cartesian_path_request(self):
+        # Load pose from JSON
+        try:
+            with open('src/par_catch_ball/ee_pose.json', 'r') as json_file:
+                pose_data = json.load(json_file)
+        except Exception as e:
+            self.get_logger().error(f"Failed to load pose: {e}")
             return
 
-        # Build the planning request
-        req = MotionPlanRequest()
-        req.group_name = 'ur_manipulator'
-        req.allowed_planning_time = 3.0
+        # Normalize quaternion
+        qx, qy, qz, qw = (
+            pose_data["orientation"]["x"],
+            pose_data["orientation"]["y"],
+            pose_data["orientation"]["z"],
+            pose_data["orientation"]["w"]
+        )
+        norm = math.sqrt(qx**2 + qy**2 + qz**2 + qw**2)
+        qx /= norm
+        qy /= norm
+        qz /= norm
+        qw /= norm
 
-        # Max‐out speed and acceleration
-        req.max_velocity_scaling_factor = 1.0
-        req.max_acceleration_scaling_factor = 1.0
+        # Build target pose
+        target_pose = Pose()
+        target_pose.position.x = pose_data["position"]["x"]
+        target_pose.position.y = pose_data["position"]["y"]
+        target_pose.position.z = pose_data["position"]["z"]
+        target_pose.orientation.x = qx
+        target_pose.orientation.y = qy
+        target_pose.orientation.z = qz
+        target_pose.orientation.w = qw
 
-        # Create a tiny box constraint around the target point
-        pc = PositionConstraint()
-        pc.header.frame_id = 'base_link'
-        pc.link_name = 'tool0'
+        # Build Cartesian path request
+        request = GetCartesianPath.Request()
+        request.group_name = 'ur_manipulator'
+        request.link_name = 'tool0'
+        request.header.frame_id = 'base_link'
+        request.max_step = 0.01
+        request.jump_threshold = 0.0
+        request.avoid_collisions = False
+        request.start_state = RobotState()
+        request.start_state.is_diff = True
+        request.waypoints.append(target_pose)
 
-        box = SolidPrimitive()
-        box.type = SolidPrimitive.BOX
-        box.dimensions = [0.002, 0.002, 0.002]  # 2 mm cube
+        self.get_logger().info("Planning Cartesian path...")
+        future = self.cartesian_client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        response = future.result()
 
-        pose = Pose()
-        pose.position = Point(x=self._point[0], y=self._point[1], z=self._point[2])
-        pose.orientation = Quaternion(w=1.0)  # keep net level
+        if not response or len(response.solution.joint_trajectory.points) == 0:
+            self.get_logger().error("Cartesian path planning failed.")
+            return
 
-        bv = BoundingVolume()
-        bv.primitives.append(box)
-        bv.primitive_poses.append(pose)
-        pc.constraint_region = bv
-        pc.weight = 1.0
+        self.get_logger().info(f"Planned path fraction: {response.fraction:.2f}")
 
-        cons = Constraints()
-        cons.position_constraints.append(pc)
-        req.goal_constraints.append(cons)
+        # Optionally scale trajectory timing (speed control)
+        scale = 0.5  # 50% speed
+        for point in response.solution.joint_trajectory.points:
+            original_sec = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+            scaled_sec = original_sec / scale
+            point.time_from_start = Duration()
+            point.time_from_start.sec = int(scaled_sec)
+            point.time_from_start.nanosec = int((scaled_sec - int(scaled_sec)) * 1e9)
+            point.velocities = [v * scale for v in point.velocities]
+            if point.accelerations:
+                point.accelerations = [a * scale**2 for a in point.accelerations]
 
-        # Save request for reuse
-        self._request = req
+        # Visualize in RViz
+        traj_msg = DisplayTrajectory()
+        traj_msg.trajectory_start = response.start_state
+        traj_msg.trajectory.append(response.solution)
+        self.traj_pub.publish(traj_msg)
+        self.get_logger().info("Published trajectory to RViz")
 
-        # First pass: plan only
-        goal = MoveGroup.Goal()
-        goal.request = req
-        goal.planning_options.plan_only  = True
-        goal.planning_options.look_around = False
-        goal.planning_options.replan     = False
+        # Execute trajectory
+        self.get_logger().info("Executing trajectory...")
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = response.solution
+        exec_future = self.execute_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, exec_future)
 
-        self.get_logger().info(f"📝 Planning trajectory to {self._point} ...")
-        plan_future = self._client.send_goal_async(goal)
-        plan_future.add_done_callback(self._on_plan_response)
-
-    def _on_plan_response(self, future):
-        goal_handle = future.result()
+        goal_handle = exec_future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("❌ Planning request was rejected.")
+            self.get_logger().error("Execution goal rejected")
             return
 
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_plan_result)
+        rclpy.spin_until_future_complete(self, result_future)
 
-    def _on_plan_result(self, future):
-        result = future.result().result
-        code   = result.error_code.val
+        self.get_logger().info("Execution complete.")
 
-        if code != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(f"❌ Planning failed (code {code}). Goal not feasible.")
-            rclpy.shutdown()
-            return
-
-        self.get_logger().info("✅ Planning successful. Executing motion...")
-
-        # Second pass: execute using same request
-        exec_goal = MoveGroup.Goal()
-        exec_goal.request = self._request
-        exec_goal.planning_options.plan_only  = False
-        exec_goal.planning_options.look_around = False
-        exec_goal.planning_options.replan     = False
-
-        exec_future = self._client.send_goal_async(exec_goal)
-        exec_future.add_done_callback(self._on_execute_response)
-
-    def _on_execute_response(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error("❌ Execution request was rejected.")
-            return
-
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_result)
-
-    def _on_result(self, future):
-        result = future.result().result
-        code   = result.error_code.val
-
-        if code != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(f"❌ Motion execution failed (code {code}).")
-        else:
-            self.get_logger().info("✅ Motion completed successfully.")
-        rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
-    # ← Replace with your computed intercept point
-    node = FastInterceptMover(0.0, 0.5, 0.5)
-    rclpy.spin(node)
-    node.destroy_node()
+    node = ExecuteCartesianPath()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
