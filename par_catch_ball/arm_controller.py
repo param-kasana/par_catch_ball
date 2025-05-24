@@ -7,43 +7,48 @@ from geometry_msgs.msg import Pose
 from moveit_msgs.srv import GetCartesianPath
 from moveit_msgs.action import ExecuteTrajectory
 from moveit_msgs.msg import DisplayTrajectory, RobotState
-import json
-import math
 from builtin_interfaces.msg import Duration
+import math
 
-
-class ExecuteCartesianPath(Node):
+class BallFollower(Node):
     def __init__(self):
-        super().__init__('execute_cartesian_path_node')
-
+        super().__init__('ball_follower_node')
         self.cartesian_client = self.create_client(GetCartesianPath, '/compute_cartesian_path')
         self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
         self.traj_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 10)
+        self.motion_in_progress = False
 
         self.get_logger().info("Waiting for MoveIt services...")
         while not self.cartesian_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Waiting for /compute_cartesian_path...')
-
         while not self.execute_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().info('Waiting for /execute_trajectory...')
 
-        self.send_cartesian_path_request()
+        self.sub = self.create_subscription(
+            Pose,
+            '/ball_in_base',
+            self.ball_pose_callback,
+            1
+        )
+        self.get_logger().info("Subscribed to /ball_in_base.")
 
-    def send_cartesian_path_request(self):
-        # Load pose from JSON
-        try:
-            with open('src/par_catch_ball/ee_pose.json', 'r') as json_file:
-                pose_data = json.load(json_file)
-        except Exception as e:
-            self.get_logger().error(f"Failed to load pose: {e}")
+    def ball_pose_callback(self, msg):
+        if self.motion_in_progress:
+            self.get_logger().info("Motion in progress, skipping new pose.")
             return
+        self.motion_in_progress = True
+        self.get_logger().info(
+            f"Received new ball pose: x={msg.position.x:.3f}, y={msg.position.y:.3f}, z={msg.position.z:.3f}"
+        )
+        self.move_to_pose(msg)
 
+    def move_to_pose(self, target_pose):
         # Normalize quaternion
         qx, qy, qz, qw = (
-            pose_data["orientation"]["x"],
-            pose_data["orientation"]["y"],
-            pose_data["orientation"]["z"],
-            pose_data["orientation"]["w"]
+            target_pose.orientation.x,
+            target_pose.orientation.y,
+            target_pose.orientation.z,
+            target_pose.orientation.w
         )
         norm = math.sqrt(qx**2 + qy**2 + qz**2 + qw**2)
         qx /= norm
@@ -51,17 +56,7 @@ class ExecuteCartesianPath(Node):
         qz /= norm
         qw /= norm
 
-        # Build target pose
-        target_pose = Pose()
-        target_pose.position.x = pose_data["position"]["x"]
-        target_pose.position.y = pose_data["position"]["y"]
-        target_pose.position.z = pose_data["position"]["z"]
-        target_pose.orientation.x = qx
-        target_pose.orientation.y = qy
-        target_pose.orientation.z = qz
-        target_pose.orientation.w = qw
-
-        # Build Cartesian path request
+        # Prepare MoveIt Cartesian path request
         request = GetCartesianPath.Request()
         request.group_name = 'ur_manipulator'
         request.link_name = 'tool0'
@@ -71,15 +66,29 @@ class ExecuteCartesianPath(Node):
         request.avoid_collisions = False
         request.start_state = RobotState()
         request.start_state.is_diff = True
-        request.waypoints.append(target_pose)
+        pose = Pose()
+        pose.position = target_pose.position
+        pose.orientation.x = qx
+        pose.orientation.y = qy
+        pose.orientation.z = qz
+        pose.orientation.w = qw
+        request.waypoints.append(pose)
 
         self.get_logger().info("Planning Cartesian path...")
         future = self.cartesian_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
-        response = future.result()
+        future.add_done_callback(self.handle_cartesian_path_response)
+
+    def handle_cartesian_path_response(self, future):
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Exception in cartesian path service: {e}")
+            self.motion_in_progress = False
+            return
 
         if not response or len(response.solution.joint_trajectory.points) == 0:
             self.get_logger().error("Cartesian path planning failed.")
+            self.motion_in_progress = False
             return
 
         self.get_logger().info(f"Planned path fraction: {response.fraction:.2f}")
@@ -108,24 +117,37 @@ class ExecuteCartesianPath(Node):
         goal = ExecuteTrajectory.Goal()
         goal.trajectory = response.solution
         exec_future = self.execute_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, exec_future)
+        exec_future.add_done_callback(self.handle_execute_trajectory_response)
 
-        goal_handle = exec_future.result()
+    def handle_execute_trajectory_response(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Exception in execute trajectory action: {e}")
+            self.motion_in_progress = False
+            return
+
         if not goal_handle.accepted:
             self.get_logger().error("Execution goal rejected")
+            self.motion_in_progress = False
             return
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        result_future.add_done_callback(self.handle_execution_result)
 
-        self.get_logger().info("Execution complete.")
-
+    def handle_execution_result(self, future):
+        try:
+            result = future.result()
+            self.get_logger().info("Execution complete.")
+        except Exception as e:
+            self.get_logger().error(f"Exception in execution result: {e}")
+        self.motion_in_progress = False
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ExecuteCartesianPath()
+    node = BallFollower()
+    rclpy.spin(node)
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
