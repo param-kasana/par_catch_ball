@@ -75,9 +75,23 @@ class BallDetector(Node):
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > 200:
+        if contours:
+            # Sort contours by area, largest first
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 200 or area > 5000:
+                    continue
+
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter == 0:
+                    continue
+
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                if circularity < 0.7:
+                    continue
+
                 (x, y), radius = cv2.minEnclosingCircle(cnt)
                 center = (int(x), int(y))
                 radius = int(radius)
