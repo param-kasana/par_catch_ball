@@ -9,6 +9,8 @@ from moveit_msgs.action import ExecuteTrajectory
 from moveit_msgs.msg import DisplayTrajectory, RobotState
 from builtin_interfaces.msg import Duration
 import math
+import time
+from collections import deque
 
 class BallFollower(Node):
     # ======= CONSTANTS FOR ARM POSITIONING ========
@@ -18,6 +20,9 @@ class BallFollower(Node):
     CONST_ORI_Z = 0.50286146632379
     CONST_ORI_W = 0.49786479095980135
     # ================================================
+    AVG_WINDOW = 20
+    MIN_DISPLACEMENT = 0.05  # 5 cm
+    PROCESS_INTERVAL = 0.5   # 0.5 seconds
 
     def __init__(self):
         super().__init__('ball_follower_node')
@@ -35,23 +40,56 @@ class BallFollower(Node):
         self.sub = self.create_subscription(PointStamped, '/ball_in_base', self.ball_point_callback, 1)
         self.get_logger().info("Subscribed to /ball_in_base.")
 
+        # Buffer for averaging
+        self.positions_y = deque(maxlen=self.AVG_WINDOW)
+        self.positions_z = deque(maxlen=self.AVG_WINDOW)
+        self.last_sent_y = None
+        self.last_sent_z = None
+        self.last_process_time = time.time()
+
     def ball_point_callback(self, msg: PointStamped):
+        # Accept points at 2 Hz (every 0.5s)
+        now = time.time()
+        if now - self.last_process_time < self.PROCESS_INTERVAL:
+            return
+        self.last_process_time = now
+
+        self.positions_y.append(msg.point.y)
+        self.positions_z.append(msg.point.z)
+
+        # Only start averaging if buffer is full
+        if len(self.positions_y) < self.AVG_WINDOW:
+            self.get_logger().info(f"Buffering positions for averaging ({len(self.positions_y)}/{self.AVG_WINDOW})")
+            return
+
+        avg_y = sum(self.positions_y) / self.AVG_WINDOW
+        avg_z = sum(self.positions_z) / self.AVG_WINDOW
+
+        if self.last_sent_y is not None and self.last_sent_z is not None:
+            dist = math.sqrt((avg_y - self.last_sent_y)**2 + (avg_z - self.last_sent_z)**2)
+            if dist < self.MIN_DISPLACEMENT:
+                self.get_logger().info(f"Displacement ({dist:.3f} m) below threshold ({self.MIN_DISPLACEMENT} m); skipping execution.")
+                return
+
         if self.motion_in_progress:
-            self.get_logger().info("Motion in progress, skipping new point.")
+            self.get_logger().info("Motion in progress, skipping new target.")
             return
         self.motion_in_progress = True
 
-        # Use constant x and orientation, y/z from incoming msg
+        # Update last sent
+        self.last_sent_y = avg_y
+        self.last_sent_z = avg_z
+
         target_pose = Pose()
         target_pose.position.x = self.CONST_X
-        target_pose.position.y = msg.point.y
-        target_pose.position.z = msg.point.z
+        target_pose.position.y = avg_y
+        target_pose.position.z = avg_z
         target_pose.orientation.x = self.CONST_ORI_X
         target_pose.orientation.y = self.CONST_ORI_Y
         target_pose.orientation.z = self.CONST_ORI_Z
         target_pose.orientation.w = self.CONST_ORI_W
 
-        self.get_logger().info(f"Received ball point y={msg.point.y:.3f}, z={msg.point.z:.3f}, using frame {msg.header.frame_id}")
+        self.get_logger().info(f"Moving to avg point y={avg_y:.3f}, z={avg_z:.3f}, using frame {msg.header.frame_id}")
         self.move_to_pose(target_pose, msg.header.frame_id)
 
     def move_to_pose(self, target_pose, frame_id):
@@ -70,7 +108,7 @@ class BallFollower(Node):
 
         # Prepare Cartesian path request
         request = GetCartesianPath.Request()
-        request.group_name = 'ur_manipulator'
+        request.group_name = 'ur_manipulator_end_effector'
         request.link_name = 'tool0'
         request.header.frame_id = frame_id  # Use frame_id from the incoming message
         request.max_step = 0.01
@@ -107,7 +145,7 @@ class BallFollower(Node):
         self.get_logger().info(f"Planned path fraction: {response.fraction:.2f}")
 
         # Optionally scale trajectory timing (speed control)
-        scale = 0.8  # 80% speed
+        scale = 0.5  # 50% speed
         for point in response.solution.joint_trajectory.points:
             original_sec = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
             scaled_sec = original_sec / scale
