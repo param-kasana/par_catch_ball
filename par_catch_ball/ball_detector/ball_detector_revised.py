@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-# Adjusted HSV range
+# Calibrated HSV range for your rubber ball
 lower_orange = np.array([2, 150, 180])
 upper_orange = np.array([10, 255, 255])
 
@@ -14,27 +14,31 @@ if not cap.isOpened():
 while True:
     ret, frame = cap.read()
     if not ret:
+        print("❌ Failed to capture frame")
         break
 
+    # Step 1: Convert to HSV and mask orange color
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lower_orange, upper_orange)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Step 2: Preprocess mask for circle detection
+    blurred = cv2.GaussianBlur(mask, (9, 9), 2)
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 200:  # skip tiny blobs
-            (x, y), radius = cv2.minEnclosingCircle(cnt)
-            center = (int(x), int(y))
-            radius = int(radius)
+    # Step 3: Apply Hough Circle Transform
+    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
+                               param1=100, param2=15, minRadius=10, maxRadius=60)
 
-            if radius > 5:
-                cv2.circle(frame, center, radius, (0, 255, 0), 2)
-                cv2.putText(frame, f"Ball @ {center}", (center[0]+10, center[1]-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                break  # Only highlight one ball
+    # Step 4: If a circle is found, draw it
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        for (x, y, r) in circles[0, :1]:  # only the first detected circle
+            cv2.circle(frame, (x, y), r, (0, 255, 0), 2)
+            cv2.putText(frame, f"Ball @ ({x}, {y})", (x + 10, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            print(f"✅ Detected circle: x={x}, y={y}, radius={r}")
+            break
 
-    # Show original and mask
+    # Show result
     cv2.imshow("Ball Detection", frame)
     cv2.imshow("HSV Mask", mask)
 
