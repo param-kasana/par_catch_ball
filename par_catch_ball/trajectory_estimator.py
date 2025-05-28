@@ -2,128 +2,181 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PointStamped
-from cv_bridge import CvBridge
-from collections import deque
+from geometry_msgs.msg import PointStamped, Point
+from visualization_msgs.msg import Marker
 import numpy as np
-import cv2
-import time
+from collections import deque
+import csv
+import os
+from datetime import datetime
 
-class TrajectoryEstimator3D(Node):
+class TrajectoryEstimator(Node):
     def __init__(self):
-        super().__init__('trajectory_estimator_3d')
-        self.bridge = CvBridge()
-        self.points = deque(maxlen=30)  # Store (timestamp, x, y, z)
+        super().__init__('trajectory_estimator')
 
-        self.fx = self.fy = self.cx = self.cy = None
-        self.camera_info_received = False
-        self.latest_image = None
+        # Subscribers and publishers
+        self.sub = self.create_subscription(PointStamped, '/ball_in_base', self.point_callback, 10)
+        self.traj_pub = self.create_publisher(Marker, '/ball_predicted_trajectory', 10)
+        self.ball_points_pub = self.create_publisher(Marker, '/ball_observed_points', 10)
+        self.pred_points_pub = self.create_publisher(Marker, '/ball_predicted_points', 10)
 
-        # Subscribers
-        self.sub_point = self.create_subscription(
-            PointStamped,
-            '/ball_point',
-            self.point_callback,
-            10
-        )
-        self.sub_image = self.create_subscription(
-            Image,
-            '/image_topic',
-            self.image_callback,
-            10
-        )
-        self.sub_cam_info = self.create_subscription(
-            CameraInfo,
-            '/camera/camera_info',
-            self.camera_info_callback,
-            10
-        )
+        # Data for trajectory fitting
+        self.history_len = 5
+        self.points = deque(maxlen=self.history_len)
+        self.times = deque(maxlen=self.history_len)
+        self.start_time = None
+        self.g = 9.81
 
-        # Publisher
-        self.pub_image = self.create_publisher(
-            Image,
-            '/trajectory_image',
-            10
-        )
+        # --- File/log setup with timestamp ---
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        log_dir = os.path.join(script_dir, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.observed_file = os.path.join(log_dir, f'observed_points_{timestamp}.csv')
+        self.predicted_file = os.path.join(log_dir, f'predicted_trajectory_{timestamp}.csv')
+        self.catch_points_file = os.path.join(log_dir, f'catch_points_{timestamp}.csv')
+        # Write headers
+        with open(self.observed_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['t', 'x', 'y', 'z'])
+        with open(self.predicted_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['t', 'x', 'y', 'z'])
+        with open(self.catch_points_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['t', 'x', 'y', 'z'])
 
-    def camera_info_callback(self, msg: CameraInfo):
-        self.fx = msg.k[0]
-        self.fy = msg.k[4]
-        self.cx = msg.k[2]
-        self.cy = msg.k[5]
-        self.camera_info_received = True
-        self.sub_cam_info.destroy()  # We only need this once
-        self.get_logger().info("✅ Camera intrinsics received.")
+        self.timer = self.create_timer(0.1, self.publish_markers)
 
-    def point_callback(self, msg: PointStamped):
-        if not self.camera_info_received:
+    def point_callback(self, msg):
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.start_time is None:
+            self.start_time = t
+        t_rel = t - self.start_time
+        pt = [msg.point.x, msg.point.y, msg.point.z]
+        self.points.append(pt)
+        self.times.append(t_rel)
+
+        os.makedirs(os.path.dirname(self.observed_file), exist_ok=True)
+        # Save to observed points file
+        with open(self.observed_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([t_rel, pt[0], pt[1], pt[2]])
+
+    def fit_trajectory(self):
+        if len(self.points) < 5:
+            return None
+
+        T = np.array(self.times)
+        X = np.array([p[0] for p in self.points])
+        Y = np.array([p[1] for p in self.points])
+        Z = np.array([p[2] for p in self.points])
+
+        A_lin = np.vstack([np.ones_like(T), T]).T
+        x0, vx0 = np.linalg.lstsq(A_lin, X, rcond=None)[0]
+        y0, vy0 = np.linalg.lstsq(A_lin, Y, rcond=None)[0]
+
+        Z_gravity = Z + 0.5 * self.g * T**2
+        z0, vz0 = np.linalg.lstsq(A_lin, Z_gravity, rcond=None)[0]
+        return x0, vx0, y0, vy0, z0, vz0
+
+    def predict_points(self, x0, vx0, y0, vy0, z0, vz0, t0, tf, dt=0.02):
+        T = np.arange(t0, tf, dt)
+        X = x0 + vx0 * T
+        Y = y0 + vy0 * T
+        Z = z0 + vz0 * T - 0.5 * self.g * T**2
+        return T, X, Y, Z
+
+    def publish_markers(self):
+        # Publish observed points marker (all observed, no filter)
+        ball_marker = Marker()
+        ball_marker.header.frame_id = "base_link"
+        ball_marker.header.stamp = self.get_clock().now().to_msg()
+        ball_marker.ns = "ball_points"
+        ball_marker.id = 1
+        ball_marker.type = Marker.POINTS
+        ball_marker.action = Marker.ADD
+        ball_marker.scale.x = 0.03
+        ball_marker.scale.y = 0.03
+        ball_marker.color.a = 1.0
+        ball_marker.color.r = 1.0  # orange
+        ball_marker.color.g = 0.55
+        ball_marker.color.b = 0.0
+        ball_marker.points = [Point(x=p[0], y=p[1], z=p[2]) for p in self.points]
+        self.ball_points_pub.publish(ball_marker)
+
+        fit = self.fit_trajectory()
+        if fit is None:
             return
-        t = time.time()
-        x, y, z = msg.point.x, msg.point.y, msg.point.z
-        self.points.append((t, x, y, z))
 
-    def image_callback(self, msg: Image):
-        if not self.camera_info_received or len(self.points) < 5:
-            return
+        x0, vx0, y0, vy0, z0, vz0 = fit
+        t0 = self.times[0]
+        tf = self.times[-1] + 0.7
 
-        try:
-            image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.latest_image = image.copy()
-            self.visualize_trajectory()
-        except Exception as e:
-            self.get_logger().error(f"Image conversion failed: {e}")
+        # Predict the full trajectory
+        T, X, Y, Z = self.predict_points(x0, vx0, y0, vy0, z0, vz0, t0, tf)
 
-    def visualize_trajectory(self):
-        image = self.latest_image.copy()
-        data = np.array(self.points)
-        t = data[:, 0] - data[0, 0]
-        x = data[:, 1]
-        y = data[:, 2]
-        z = data[:, 3]
+        # Save full predicted trajectory to file
+        with open(self.predicted_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['t', 'x', 'y', 'z'])
+            for t, x, y, z in zip(T, X, Y, Z):
+                writer.writerow([t, x, y, z])
 
-        # Fit using least squares
-        A_lin = np.vstack([t, np.ones(len(t))]).T
-        vx, cx = np.linalg.lstsq(A_lin, x, rcond=None)[0]
-        vy, cy = np.linalg.lstsq(A_lin, y, rcond=None)[0]
+        # Publish full predicted trajectory as LINE_STRIP
+        traj_marker = Marker()
+        traj_marker.header.frame_id = "base_link"
+        traj_marker.header.stamp = self.get_clock().now().to_msg()
+        traj_marker.ns = "ball_trajectory"
+        traj_marker.id = 0
+        traj_marker.type = Marker.LINE_STRIP
+        traj_marker.action = Marker.ADD
+        traj_marker.scale.x = 0.01
+        traj_marker.color.a = 1.0
+        traj_marker.color.r = 0.0
+        traj_marker.color.g = 1.0
+        traj_marker.color.b = 0.0
+        traj_marker.points = [Point(x=float(x), y=float(y), z=float(z)) for x, y, z in zip(X, Y, Z)]
+        self.traj_pub.publish(traj_marker)
 
-        A_quad = np.vstack([t**2, t, np.ones(len(t))]).T
-        az, bz, cz = np.linalg.lstsq(A_quad, z, rcond=None)[0]
+        # --- Catch points: 0.2 <= z <= 0.4, x < -1.0 ---
+        catch_mask = (Z >= 0.2) & (Z <= 0.4) & (X < -0.7)
+        X_catch = X[catch_mask]
+        Y_catch = Y[catch_mask]
+        Z_catch = Z[catch_mask]
+        T_catch = T[catch_mask]
 
-        # Predict future 3D positions
-        t_future = np.linspace(t[-1], t[-1] + 1.0, 30)
-        x_future = vx * t_future + cx
-        y_future = vy * t_future + cy
-        z_future = az * t_future**2 + bz * t_future + cz
+        # Save catch points to file
+        with open(self.catch_points_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['t', 'x', 'y', 'z'])
+            for t, x, y, z in zip(T_catch, X_catch, Y_catch, Z_catch):
+                writer.writerow([t, x, y, z])
 
-        # Project to image plane using camera intrinsics
-        for i in range(1, len(t_future)):
-            if z_future[i] <= 0:
-                continue  # skip invalid depth
-
-            u1 = int((x_future[i - 1] * self.fx) / z_future[i - 1] + self.cx)
-            v1 = int((y_future[i - 1] * self.fy) / z_future[i - 1] + self.cy)
-            u2 = int((x_future[i] * self.fx) / z_future[i] + self.cx)
-            v2 = int((y_future[i] * self.fy) / z_future[i] + self.cy)
-
-            if all(0 <= val < dim for val, dim in zip((u1, v1, u2, v2), (image.shape[1], image.shape[0], image.shape[1], image.shape[0]))):
-                cv2.line(image, (u1, v1), (u2, v2), (255, 0, 0), 2)
-
-        # Final predicted point
-        final_u = int((x_future[-1] * self.fx) / z_future[-1] + self.cx)
-        final_v = int((y_future[-1] * self.fy) / z_future[-1] + self.cy)
-        if 0 <= final_u < image.shape[1] and 0 <= final_v < image.shape[0]:
-            cv2.circle(image, (final_u, final_v), 6, (0, 0, 255), -1)
-
-        # Publish the final image
-        img_msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
-        self.pub_image.publish(img_msg)
-        self.get_logger().info("📤 Published predicted 3D trajectory.")
+        # Publish predicted points marker (catch points only)
+        pred_marker = Marker()
+        pred_marker.header.frame_id = "base_link"
+        pred_marker.header.stamp = self.get_clock().now().to_msg()
+        pred_marker.ns = "predicted_points"
+        pred_marker.id = 2
+        pred_marker.type = Marker.POINTS
+        pred_marker.action = Marker.ADD
+        pred_marker.scale.x = 0.03
+        pred_marker.scale.y = 0.03
+        pred_marker.color.a = 1.0
+        pred_marker.color.r = 0.0
+        pred_marker.color.g = 1.0
+        pred_marker.color.b = 0.0
+        pred_marker.points = [Point(x=float(x), y=float(y), z=float(z)) for x, y, z in zip(X_catch, Y_catch, Z_catch)]
+        self.pred_points_pub.publish(pred_marker)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TrajectoryEstimator3D()
-    rclpy.spin(node)
+    node = TrajectoryEstimator()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 
