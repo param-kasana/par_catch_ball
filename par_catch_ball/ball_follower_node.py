@@ -12,6 +12,16 @@ import math
 import time
 from collections import deque
 
+def clamp_to_circle(y, z, center_y, center_z, radius):
+    dy = y - center_y
+    dz = z - center_z
+    dist = math.sqrt(dy**2 + dz**2)
+    if dist > radius:
+        scale = radius / dist
+        y = center_y + dy * scale
+        z = center_z + dz * scale
+    return y, z
+
 class BallFollower(Node):
     # ======= CONSTANTS FOR ARM POSITIONING ========
     CONST_X = -0.2
@@ -20,9 +30,13 @@ class BallFollower(Node):
     CONST_ORI_Z = 0.50286146632379
     CONST_ORI_W = 0.49786479095980135
     # ================================================
-    AVG_WINDOW = 20
+    AVG_WINDOW = 10
     MIN_DISPLACEMENT = 0.05  # 5 cm
-    PROCESS_INTERVAL = 0.5   # 0.5 seconds
+    PROCESS_INTERVAL = 0.2   # seconds
+
+    CENTER_Y = 0.14362462490424646
+    CENTER_Z = 0.742090833804857
+    RADIUS = 0.3
 
     def __init__(self):
         super().__init__('ball_follower_node')
@@ -30,6 +44,7 @@ class BallFollower(Node):
         self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
         self.traj_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 10)
         self.motion_in_progress = False
+        self.target_queue = deque()
 
         self.get_logger().info("Waiting for MoveIt services...")
         while not self.cartesian_client.wait_for_service(timeout_sec=1.0):
@@ -40,7 +55,6 @@ class BallFollower(Node):
         self.sub = self.create_subscription(PointStamped, '/ball_in_base', self.ball_point_callback, 1)
         self.get_logger().info("Subscribed to /ball_in_base.")
 
-        # Buffer for averaging
         self.positions_y = deque(maxlen=self.AVG_WINDOW)
         self.positions_z = deque(maxlen=self.AVG_WINDOW)
         self.last_sent_y = None
@@ -48,7 +62,6 @@ class BallFollower(Node):
         self.last_process_time = time.time()
 
     def ball_point_callback(self, msg: PointStamped):
-        # Accept points at 2 Hz (every 0.5s)
         now = time.time()
         if now - self.last_process_time < self.PROCESS_INTERVAL:
             return
@@ -57,43 +70,52 @@ class BallFollower(Node):
         self.positions_y.append(msg.point.y)
         self.positions_z.append(msg.point.z)
 
-        # Only start averaging if buffer is full
         if len(self.positions_y) < self.AVG_WINDOW:
-            self.get_logger().info(f"Buffering positions for averaging ({len(self.positions_y)}/{self.AVG_WINDOW})")
+            self.get_logger().info(f"Buffering positions ({len(self.positions_y)}/{self.AVG_WINDOW})")
             return
 
         avg_y = sum(self.positions_y) / self.AVG_WINDOW
         avg_z = sum(self.positions_z) / self.AVG_WINDOW
 
+        clamped_y, clamped_z = clamp_to_circle(avg_y, avg_z, self.CENTER_Y, self.CENTER_Z, self.RADIUS)
+        if (clamped_y, clamped_z) != (avg_y, avg_z):
+            self.get_logger().warn(f"Target outside area; clamped to ({clamped_y:.3f}, {clamped_z:.3f})")
+
         if self.last_sent_y is not None and self.last_sent_z is not None:
-            dist = math.sqrt((avg_y - self.last_sent_y)**2 + (avg_z - self.last_sent_z)**2)
+            dist = math.sqrt((clamped_y - self.last_sent_y)**2 + (clamped_z - self.last_sent_z)**2)
             if dist < self.MIN_DISPLACEMENT:
-                self.get_logger().info(f"Displacement ({dist:.3f} m) below threshold ({self.MIN_DISPLACEMENT} m); skipping execution.")
+                self.get_logger().info(f"Displacement {dist:.3f} below threshold; skipping.")
                 return
 
-        if self.motion_in_progress:
-            self.get_logger().info("Motion in progress, skipping new target.")
-            return
-        self.motion_in_progress = True
-
-        # Update last sent
-        self.last_sent_y = avg_y
-        self.last_sent_z = avg_z
+        self.last_sent_y = clamped_y
+        self.last_sent_z = clamped_z
 
         target_pose = Pose()
         target_pose.position.x = self.CONST_X
-        target_pose.position.y = avg_y
-        target_pose.position.z = avg_z
+        target_pose.position.y = clamped_y
+        target_pose.position.z = clamped_z
         target_pose.orientation.x = self.CONST_ORI_X
         target_pose.orientation.y = self.CONST_ORI_Y
         target_pose.orientation.z = self.CONST_ORI_Z
         target_pose.orientation.w = self.CONST_ORI_W
 
-        self.get_logger().info(f"Moving to avg point y={avg_y:.3f}, z={avg_z:.3f}, using frame {msg.header.frame_id}")
-        self.move_to_pose(target_pose, msg.header.frame_id)
+        self.target_queue.append((target_pose, msg.header.frame_id))
+        self.get_logger().info(f"Queued target y={clamped_y:.3f}, z={clamped_z:.3f}")
+
+        if not self.motion_in_progress:
+            self.process_next_trajectory()
+
+    def process_next_trajectory(self):
+        if not self.target_queue:
+            self.get_logger().info("Queue empty.")
+            self.motion_in_progress = False
+            return
+
+        target_pose, frame_id = self.target_queue.popleft()
+        self.motion_in_progress = True
+        self.move_to_pose(target_pose, frame_id)
 
     def move_to_pose(self, target_pose, frame_id):
-        # Normalize quaternion
         qx, qy, qz, qw = (
             target_pose.orientation.x,
             target_pose.orientation.y,
@@ -106,11 +128,10 @@ class BallFollower(Node):
         qz /= norm
         qw /= norm
 
-        # Prepare Cartesian path request
         request = GetCartesianPath.Request()
         request.group_name = 'ur_manipulator_end_effector'
         request.link_name = 'tool0'
-        request.header.frame_id = frame_id  # Use frame_id from the incoming message
+        request.header.frame_id = frame_id
         request.max_step = 0.01
         request.jump_threshold = 0.0
         request.avoid_collisions = False
@@ -125,7 +146,7 @@ class BallFollower(Node):
         pose.orientation.w = qw
         request.waypoints.append(pose)
 
-        self.get_logger().info(f"Planning Cartesian path in frame: {frame_id}")
+        self.get_logger().info(f"Planning path in frame: {frame_id}")
         future = self.cartesian_client.call_async(request)
         future.add_done_callback(self.handle_cartesian_path_response)
 
@@ -133,38 +154,33 @@ class BallFollower(Node):
         try:
             response = future.result()
         except Exception as e:
-            self.get_logger().error(f"Exception in cartesian path service: {e}")
+            self.get_logger().error(f"Path planning failed: {e}")
             self.motion_in_progress = False
             return
 
         if not response or len(response.solution.joint_trajectory.points) == 0:
-            self.get_logger().error("Cartesian path planning failed.")
+            self.get_logger().error("Empty Cartesian path.")
             self.motion_in_progress = False
             return
 
         self.get_logger().info(f"Planned path fraction: {response.fraction:.2f}")
 
-        # Optionally scale trajectory timing (speed control)
-        scale = 0.5  # 50% speed
+        scale = 0.7
         for point in response.solution.joint_trajectory.points:
             original_sec = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
             scaled_sec = original_sec / scale
-            point.time_from_start = Duration()
             point.time_from_start.sec = int(scaled_sec)
             point.time_from_start.nanosec = int((scaled_sec - int(scaled_sec)) * 1e9)
             point.velocities = [v * scale for v in point.velocities]
             if point.accelerations:
                 point.accelerations = [a * scale**2 for a in point.accelerations]
 
-        # Visualize in RViz
         traj_msg = DisplayTrajectory()
         traj_msg.trajectory_start = response.start_state
         traj_msg.trajectory.append(response.solution)
         self.traj_pub.publish(traj_msg)
-        self.get_logger().info("Published trajectory to RViz")
+        self.get_logger().info("Published trajectory to RViz.")
 
-        # Execute trajectory
-        self.get_logger().info("Executing trajectory...")
         goal = ExecuteTrajectory.Goal()
         goal.trajectory = response.solution
         exec_future = self.execute_client.send_goal_async(goal)
@@ -174,12 +190,12 @@ class BallFollower(Node):
         try:
             goal_handle = future.result()
         except Exception as e:
-            self.get_logger().error(f"Exception in execute trajectory action: {e}")
+            self.get_logger().error(f"Execution goal error: {e}")
             self.motion_in_progress = False
             return
 
         if not goal_handle.accepted:
-            self.get_logger().error("Execution goal rejected")
+            self.get_logger().error("Execution goal rejected.")
             self.motion_in_progress = False
             return
 
@@ -191,16 +207,14 @@ class BallFollower(Node):
             result = future.result()
             self.get_logger().info("Execution complete.")
         except Exception as e:
-            self.get_logger().error(f"Exception in execution result: {e}")
-        self.motion_in_progress = False
-
+            self.get_logger().error(f"Execution result error: {e}")
+        self.process_next_trajectory()
 
 def main(args=None):
     rclpy.init(args=args)
     node = BallFollower()
     rclpy.spin(node)
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
