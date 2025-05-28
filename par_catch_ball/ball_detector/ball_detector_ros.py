@@ -14,7 +14,7 @@ from rclpy.duration import Duration
 
 class BallDetector(Node):
     def __init__(self):
-        super().__init__('ball_detector_hough')
+        super().__init__('ball_detector')
 
         self.rgb_topic = '/camera/camera/color/image_raw'
         self.depth_topic = '/camera/camera/depth/image_rect_raw'
@@ -38,19 +38,19 @@ class BallDetector(Node):
         self.create_subscription(Image, self.rgb_topic, self.rgb_callback, 10)
         self.create_subscription(Image, self.depth_topic, self.depth_callback, 10)
 
-        self.get_logger().info(" Ball detector with Hough Circle Transform started.")
+        self.get_logger().info("3D Ball Detector with Hough Circle Transform started.")
 
     def camera_info_callback(self, msg):
         if not self.camera_info_received:
             self.camera_model.fromCameraInfo(msg)
             self.camera_info_received = True
-            self.get_logger().info(" Camera info received.")
+            self.get_logger().info("Camera info received.")
 
     def depth_callback(self, msg):
         try:
             self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         except Exception as e:
-            self.get_logger().error(f" Depth conversion failed: {e}")
+            self.get_logger().error(f"Depth conversion failed: {e}")
 
     def rgb_callback(self, msg):
         if not self.camera_info_received or self.latest_depth is None:
@@ -59,32 +59,31 @@ class BallDetector(Node):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().error(f" RGB conversion failed: {e}")
+            self.get_logger().error(f"RGB conversion failed: {e}")
             return
 
-        # Step 1: HSV Filtering
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower_orange = np.array([2, 150, 180])
         upper_orange = np.array([10, 255, 255])
         mask = cv2.inRange(hsv, lower_orange, upper_orange)
 
-        # Step 2: Blur and detect circles
+        # === CHANGE 1: Gaussian blur before Hough Circle detection ===
         blurred = cv2.GaussianBlur(mask, (9, 9), 2)
+
+        # === CHANGE 2: Hough Circle Detection ===
         circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
                                    param1=100, param2=15, minRadius=10, maxRadius=60)
 
         if circles is not None:
             circles = np.uint16(np.around(circles))
-            for (x, y, r) in circles[0, :1]:  # Only the first circle
+            for (x, y, r) in circles[0, :1]:  # process only first valid circle
                 u, v = int(x), int(y)
                 radius = int(r)
 
-                # Depth at center
-                depth = self.latest_depth[v, u] / 1000.0  # in meters
+                depth = self.latest_depth[v, u] / 1000.0  # meters
                 if depth == 0.0 or np.isnan(depth) or depth > 5.0:
                     continue
 
-                # Project to 3D
                 ray = self.camera_model.projectPixelTo3dRay((u, v))
                 point_camera = np.array(ray) * depth
 
@@ -103,21 +102,17 @@ class BallDetector(Node):
                     pt_base = do_transform_point(pt, transform)
                     self.base_pub.publish(pt_base)
                 except Exception as e:
-                    self.get_logger().warn(f" TF transform failed: {e}")
+                    self.get_logger().warn(f"TF transform failed: {e}")
 
-                # Draw circle and label
+                # === CHANGE 3: draw detected circle ===
                 cv2.circle(frame, (u, v), radius, (0, 255, 0), 2)
-                cv2.putText(frame, f"Ball @ ({u}, {v})", (u + 10, v - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                break
+                cv2.putText(frame, f"({pt.point.x:.2f}, {pt.point.y:.2f}, {pt.point.z:.2f})",
+                            (u + 10, v - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                break  # only one circle
 
-        # Publish debug image
-        try:
-            debug_img = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
-            debug_img.header = msg.header
-            self.debug_pub.publish(debug_img)
-        except Exception as e:
-            self.get_logger().warn(f" Debug image conversion failed: {e}")
+        debug_img = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        debug_img.header = msg.header
+        self.debug_pub.publish(debug_img)
 
 def main(args=None):
     rclpy.init(args=args)
